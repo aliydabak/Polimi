@@ -1,0 +1,151 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
+from sklearn.decomposition import TruncatedSVD, LatentDirichletAllocation
+from sklearn.metrics import r2_score, mean_squared_error, roc_auc_score, roc_curve
+import shap
+
+# Load data
+df = pd.read_excel('/mnt/data/Full_Contracts_Analysis_With_RF_MonteCarlo.xlsx')
+
+# Data cleaning and feature engineering
+df['overrun_amount'] = df['revised_amount'] - df['original_amount']
+df['overrun_pct'] = df['overrun_amount'] / df['original_amount']
+
+# EDA: Histograms of costs
+plt.figure(figsize=(10, 4))
+plt.hist(np.log10(df['original_amount'] + 1), bins=50, alpha=0.7, label='Original')
+plt.hist(np.log10(df['revised_amount'] + 1), bins=50, alpha=0.7, label='Revised')
+plt.xlabel('Log10(Amount + 1)')
+plt.ylabel('Count')
+plt.title('Distribution of Original and Revised Contract Amounts')
+plt.legend()
+plt.show()
+
+# Correlation heatmap
+corr = df[['original_amount', 'revised_amount', 'overrun_amount', 'overrun_pct']].corr()
+plt.figure(figsize=(6, 5))
+plt.imshow(corr, cmap='coolwarm', interpolation='nearest')
+plt.xticks(range(len(corr)), corr.columns, rotation=45)
+plt.yticks(range(len(corr)), corr.columns)
+for i in range(len(corr)):
+    for j in range(len(corr)):
+        plt.text(j, i, f"{corr.iloc[i, j]:.2f}", ha='center', va='center', color='white')
+plt.title('Correlation Matrix')
+plt.colorbar()
+plt.show()
+
+# One-hot encode contract_type
+ohe = OneHotEncoder(sparse=False)
+type_features = ohe.fit_transform(df[['contract_type']])
+type_df = pd.DataFrame(type_features, columns=ohe.get_feature_names_out(['type']))
+df_ohe = pd.concat([df, type_df], axis=1)
+
+# TF-IDF + SVD for text embeddings
+tfidf = TfidfVectorizer(max_features=500, stop_words='english')
+text_vec = tfidf.fit_transform(df['contract_description'].fillna(''))
+svd = TruncatedSVD(n_components=2, random_state=42)
+text_embed = svd.fit_transform(text_vec)
+
+plt.figure(figsize=(8, 6))
+for t in df['contract_type'].unique():
+    idx = df['contract_type'] == t
+    plt.scatter(text_embed[idx, 0], text_embed[idx, 1], label=t, alpha=0.5)
+plt.xlabel('Component 1')
+plt.ylabel('Component 2')
+plt.title('2D Embedding of Project Descriptions (TF-IDF + SVD)')
+plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+plt.tight_layout()
+plt.show()
+
+# LDA topic modeling
+count_vect = CountVectorizer(max_features=1000, stop_words='english')
+count_vec = count_vect.fit_transform(df['contract_description'].fillna(''))
+lda = LatentDirichletAllocation(n_components=5, random_state=42)
+lda_topics = lda.fit_transform(count_vec)
+
+# Display top words per topic
+n_top_words = 10
+feature_names = count_vect.get_feature_names_out()
+for topic_idx, comp in enumerate(lda.components_):
+    top_features_ind = comp.argsort()[:-n_top_words - 1:-1]
+    top_features = [feature_names[i] for i in top_features_ind]
+    print(f"Topic {topic_idx+1}: {', '.join(top_features)}")
+
+# Random Forest for final cost prediction
+features = ['original_amount'] + list(type_df.columns)
+X = df_ohe[features]
+y = df_ohe['revised_amount']
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+rf = RandomForestRegressor(n_estimators=100, random_state=42)
+rf.fit(X_train, y_train)
+y_pred = rf.predict(X_test)
+print("RF R^2:", r2_score(y_test, y_pred))
+print("RF RMSE:", np.sqrt(mean_squared_error(y_test, y_pred)))
+
+# Plot predicted vs actual
+plt.figure(figsize=(6, 6))
+plt.scatter(y_test, y_pred, alpha=0.5)
+plt.plot([y.min(), y.max()], [y.min(), y.max()], 'r--')
+plt.xlabel('Actual Final Cost')
+plt.ylabel('Predicted Final Cost')
+plt.title('Random Forest: Predicted vs. Actual')
+plt.show()
+
+# SHAP feature importance
+explainer = shap.TreeExplainer(rf)
+shap_values = explainer.shap_values(X_test)
+shap.summary_plot(shap_values, X_test, plot_type="bar")
+
+# ANN for overrun classification
+from sklearn.neural_network import MLPClassifier
+df_ohe['overrun_flag'] = (df_ohe['overrun_amount'] > 0).astype(int)
+X_clf = df_ohe[['original_amount'] + list(type_df.columns)]
+y_clf = df_ohe['overrun_flag']
+Xc_train, Xc_test, yc_train, yc_test = train_test_split(X_clf, y_clf, test_size=0.2, random_state=42)
+ann = MLPClassifier(hidden_layer_sizes=(16, 8), max_iter=300, random_state=42)
+ann.fit(Xc_train, yc_train)
+yc_pred = ann.predict_proba(Xc_test)[:, 1]
+fpr, tpr, _ = roc_curve(yc_test, yc_pred)
+plt.figure(figsize=(6, 6))
+plt.plot(fpr, tpr, label=f'AUC = {roc_auc_score(yc_test, yc_pred):.2f}')
+plt.plot([0, 1], [0, 1], 'r--')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('ANN Overrun Classification ROC Curve')
+plt.legend()
+plt.show()
+
+# Monte Carlo simulation for a single project
+n_sim = 10000
+mean_cost = 1.1e6  # $1.1M expected
+std_cost = 0.2e6   # $0.2M std dev
+sim_costs = np.random.normal(mean_cost, std_cost, n_sim)
+sim_costs = np.clip(sim_costs, 0, None)
+plt.figure(figsize=(8, 4))
+plt.hist(sim_costs, bins=50, alpha=0.7)
+plt.axvline(1e6, color='r', linestyle='--', label='Original Budget ($1M)')
+plt.axvline(mean_cost, color='k', linestyle='--', label='Expected Cost ($1.1M)')
+plt.xlabel('Simulated Final Cost')
+plt.ylabel('Frequency')
+plt.title('Monte Carlo Simulation of Single Project Cost')
+plt.legend()
+plt.show()
+
+# Monte Carlo simulation for portfolio of 5 projects
+budgets = np.array([0.4e6, 0.5e6, 0.6e6, 0.8e6, 0.7e6])
+means = budgets * 1.05  # assume 5% overrun
+stds = budgets * 0.15   # 15% std dev
+portfolio_sims = (np.random.normal(means, stds, (n_sim, 5))).sum(axis=1)
+plt.figure(figsize=(8, 4))
+plt.hist(portfolio_sims, bins=50, alpha=0.7)
+plt.axvline(budgets.sum(), color='r', linestyle='--', label='Original Total Budget')
+plt.xlabel('Total Simulated Portfolio Cost')
+plt.ylabel('Frequency')
+plt.title('Monte Carlo Simulation of 5-Project Portfolio Cost')
+plt.legend()
+plt.show()
